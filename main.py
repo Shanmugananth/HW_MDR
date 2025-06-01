@@ -7,6 +7,8 @@ from PIL import Image
 import io
 import tensorflow as tf
 from tensorflow import keras
+from tensorflow.keras.models import load_model
+
 
 app = Flask(__name__)
 CORS(app)  # Enable Cross-Origin Resource Sharing
@@ -325,86 +327,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def create_cnn_model():
-    """Create and compile a CNN model for digit recognition"""
-    model = keras.Sequential([
-        keras.layers.Reshape((28, 28, 1), input_shape=(28, 28)),
-        
-        # First Convolutional Block
-        keras.layers.Conv2D(32, (3, 3), activation='relu'),
-        keras.layers.MaxPooling2D((2, 2)),
-        
-        # Second Convolutional Block
-        keras.layers.Conv2D(64, (3, 3), activation='relu'),
-        keras.layers.MaxPooling2D((2, 2)),
-        
-        # Third Convolutional Block
-        keras.layers.Conv2D(64, (3, 3), activation='relu'),
-        
-        # Flatten and Dense layers
-        keras.layers.Flatten(),
-        keras.layers.Dense(64, activation='relu'),
-        keras.layers.Dropout(0.5),
-        keras.layers.Dense(10, activation='softmax')
-    ])
-    
-    model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    return model
-
-def train_model():
-    """Train the model on MNIST dataset"""
-    print("Loading and training model...")
-    
-    # Load MNIST dataset
-    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
-    
-    # Normalize the data
-    x_train = x_train.astype('float32') / 255.0
-    x_test = x_test.astype('float32') / 255.0
-    
-    # Create and train the model
-    model = create_cnn_model()
-    
-    # Train the model (reduced epochs for faster deployment)
-    model.fit(x_train, y_train, 
-              epochs=3,  # Reduced for faster deployment
-              batch_size=128,
-              validation_data=(x_test, y_test),
-              verbose=1)
-    
-    # Evaluate the model
-    test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
-    print(f"Test accuracy: {test_acc:.4f}")
-    
-    return model
-
-def load_or_train_model():
-    """Load existing model or train a new one"""
-    model_path = '/app/models/digit_recognition_model.h5'
-    
-    try:
-        # Try to load pre-trained model
-        if os.path.exists(model_path):
-            model = keras.models.load_model(model_path)
-            print("Loaded existing model")
-        else:
-            raise FileNotFoundError("Model not found")
-    except:
-        # Train new model if loading fails
-        print("Training new model...")
-        model = train_model()
-        # Save the trained model
-        os.makedirs('/app/models', exist_ok=True)
-        model.save(model_path)
-        print("Model saved")
-    
-    return model
-
 def preprocess_image(image_data):
     """Preprocess the image for prediction"""
     try:
@@ -427,14 +349,63 @@ def preprocess_image(image_data):
         # Normalize
         img_array = img_array.astype('float32') / 255.0
         
-        # Reshape for model input
-        img_array = img_array.reshape(1, 28, 28)
+        # Reshape for model input (adjust based on your model's expected input shape)
+        img_array = img_array.reshape(1, 28, 28, 1)  # For CNN models
+        # If your model expects flattened input, use: img_array.reshape(1, 784)
         
         return img_array
         
     except Exception as e:
         print(f"Error preprocessing image: {e}")
         return None
+
+def segment_digits(thresh_image):
+    """Segment individual digits from the image"""
+    # Find contours
+    contours, _ = cv2.findContours(thresh_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Filter contours first, then sort by x-coordinate (left to right)
+    valid_contours = []
+
+    for contour in contours:
+        # Filter out very small contours (noise)
+        if cv2.contourArea(contour) < 100:
+            continue
+            
+        # Get bounding rectangle
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Filter by size and aspect ratio
+        if w > 15 and h > 15 and w < 200 and h < 200:
+            aspect_ratio = w / h
+            if 0.2 <= aspect_ratio <= 3.0:
+                valid_contours.append((contour, x, y, w, h))
+    
+    # FIXED: Sort by x-coordinate (left to right) instead of area
+    valid_contours.sort(key=lambda item: item[1])  # Sort by x-coordinate
+
+    digit_images = []
+    bounding_boxes = []
+
+    for contour, x, y, w, h in valid_contours:
+        # Check for overlapping bounding boxes (remove duplicates)
+        overlap = False
+        for existing_x, existing_y, existing_w, existing_h in bounding_boxes:
+            # Check if current box significantly overlaps with existing ones
+            if (abs(x - existing_x) < 20 and abs(y - existing_y) < 20):
+                overlap = True
+                break
+
+        if not overlap:
+            digit_roi = thresh_image[y:y+h, x:x+w]
+            pad = 10
+            padded = cv2.copyMakeBorder(digit_roi, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+            resized = cv2.resize(padded, (28, 28), interpolation=cv2.INTER_AREA)
+
+            digit_images.append(resized)
+            bounding_boxes.append((x, y, w, h))
+
+    return digit_images, bounding_boxes
 
 @app.route('/')
 def index():
@@ -445,6 +416,13 @@ def index():
 def predict_digit():
     """Predict the digit from uploaded image"""
     try:
+        # Check if model is loaded
+        if model is None:
+            return jsonify({
+                'success': False,
+                'error': 'Model not loaded. Please check server logs.'
+            })
+        
         # Check if image is in request
         if 'image' not in request.files:
             return jsonify({
@@ -454,28 +432,81 @@ def predict_digit():
         
         # Get image file
         image_file = request.files['image']
-        image_data = image_file.read()
+        img= image_file.read()
         
-        # Preprocess image
-        processed_image = preprocess_image(image_data)
+        #Preporcessing
+        threshold_image, original_gray = preprocess_image(img)
+
+        #Segmenting digits
+        digits, bounding_boxes = segment_digits(threshold_image)
         
-        if processed_image is None:
+        if digits is None:
             return jsonify({
                 'success': False,
                 'error': 'Failed to process image'
             })
         
+        # Preprocess for model
+        processed_digits = []
+        for digit in digits:
+            # Try inverting colors - MNIST has white digits on black background
+            inverted = 255 - digit
+
+            # Normalize
+            normalized = inverted.astype('float32') / 255.0
+            processed_digits.append(normalized)
+
+        processed_digits = np.array(processed_digits)
+
+        #adds channel dimension
+        processed_digits = processed_digits.reshape(-1, 28, 28, 1)
+
         # Make prediction
-        prediction = model.predict(processed_image, verbose=0)
-        predicted_digit = int(np.argmax(prediction[0]))
-        confidence = float(np.max(prediction[0]))
+        prediction = model.predict(processed_digits)
+        predicted_classes = np.argmax(prediction, axis=1)
+        confidence_scores = np.max(prediction, axis=1)
+        #predicted_digit = int(np.argmax(prediction[0]))
+        #confidence = float(np.max(prediction[0]))
         
-        return jsonify({
-            'success': True,
-            'prediction': predicted_digit,
-            'confidence': confidence,
-            'all_probabilities': prediction[0].tolist()
-        })
+        #Threshold Confidence
+        confidence_threshold = 0.5
+
+        # Filter by confidence
+        results = []
+        for i, (pred_class, confidence) in enumerate(zip(predicted_classes, confidence_scores)):
+            if confidence >= confidence_threshold:
+                results.append({
+                    'digit': int(pred_class),
+                    'confidence': float(confidence),
+                    'index': i  # Since we don't have bounding boxes in canvas case
+                })
+        
+        # Prepare response based on results
+        if results:
+            # Sort by confidence (highest first) since we don't have x-coordinates
+            results.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            return jsonify({
+                'success': True,
+                'high_confidence_results': results,
+                'best_prediction': results[0],  # Highest confidence
+                'total_confident_predictions': len(results),
+                'confidence_threshold': confidence_threshold,
+                'all_probabilities': prediction[0].tolist()
+            })
+        else:
+            # No high confidence predictions
+            return jsonify({
+                'success': True,
+                'high_confidence_results': [],
+                'message': f'No predictions above {confidence_threshold} confidence threshold',
+                'best_available': {
+                    'digit': int(predicted_classes[0]),
+                    'confidence': float(confidence_scores[0])
+                },
+                'confidence_threshold': confidence_threshold
+            })
+ 
         
     except Exception as e:
         print(f"Error in prediction: {e}")
@@ -486,25 +517,29 @@ def predict_digit():
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint for GCP"""
+    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'model_loaded': model is not None
     })
 
 if __name__ == '__main__':
-    print("Starting Flask server...")
-    print("Loading/training model...")
+    print("🚀 Starting Flask server...")
     
-    # Load or train the model
-    model = load_or_train_model()
+    # Model Path
+    model = load_model('./model.h5')
     
-    print("Model ready!")
+    if model is None:
+        print("❌ Failed to load model. Server will start but predictions won't work.")
+        print("Please check the model path and try again.")
+    else:
+        print("✅ Model loaded successfully! Ready to make predictions.")
     
     # Get port from environment variable (Cloud Run requirement)
     port = int(os.environ.get('PORT', 8080))
     
-    print(f"Starting server on port {port}")
+    print(f"🌐 Starting server on port {port}")
+    print(f"📱 Access the app at: http://localhost:{port}")
     
     # Run the Flask app
     app.run(debug=False, host='0.0.0.0', port=port)
